@@ -1,0 +1,489 @@
+// Copyright (c) 2026 Nikita Petrov (https://github.com/NikkittaP)
+// SPDX-License-Identifier: MIT
+
+#include "StreamManagerRTSP.h"
+#include "RTSPStreamerImpl.h"
+
+DEFINE_LOG_CATEGORY(LogStreamRTSP);
+
+#include "Runtime/Engine/Classes/Engine/Engine.h"
+#include "Engine/SceneCapture2D.h"
+#include "Components/SceneCaptureComponent2D.h"
+#include "Engine/TextureRenderTarget2D.h"
+#include "TextureResource.h"
+#include "ShowFlags.h"
+
+#include "RHICommandList.h"
+#include "RenderingThread.h"
+
+#include "Slate/WidgetRenderer.h"
+#include "Blueprint/UserWidget.h"
+#include "Widgets/SOverlay.h"
+
+// Bridge FRTSPStreamerImpl logs (a UE-header-free TU) into the UE log category.
+static void RtspLogToUE(int Level, const char* Msg)
+{
+	const FString S = UTF8_TO_TCHAR(Msg);
+	switch (Level)
+	{
+		case 2:  UE_LOG(LogStreamRTSP, Error,   TEXT("%s"), *S); break;
+		case 1:  UE_LOG(LogStreamRTSP, Warning, TEXT("%s"), *S); break;
+		case 3:  UE_LOG(LogStreamRTSP, Verbose, TEXT("%s"), *S); break;
+		default: UE_LOG(LogStreamRTSP, Log,     TEXT("%s"), *S); break;
+	}
+}
+
+AStreamManagerRTSP::AStreamManagerRTSP()
+{
+	PrimaryActorTick.bCanEverTick = true;
+}
+
+void AStreamManagerRTSP::BeginPlay()
+{
+	Super::BeginPlay();
+
+	if (!CaptureComponent)
+	{
+		UE_LOG(LogStreamRTSP, Error, TEXT("No CaptureComponent set! RTSP stream will not start."));
+		return;
+	}
+
+	SetupCaptureComponent();
+
+	FRTSPStreamerImpl::SetLogCallback(&RtspLogToUE);
+	StreamerImpl = new FRTSPStreamerImpl();
+
+	FRTSPStreamerImpl::FSettings Settings;
+	Settings.Port               = ServerPort;
+	Settings.MountPoint         = TCHAR_TO_UTF8(*MountPoint);
+	Settings.Width              = FrameWidth;
+	Settings.Height             = FrameHeight;
+	Settings.Fps                = TargetFPS;
+	Settings.BitrateKbps        = TargetBitrateKbps;
+	Settings.bUseHardwareEncoder = bUseHardwareEncoder;
+
+	if (!StreamerImpl->Start(Settings))
+	{
+		UE_LOG(LogStreamRTSP, Error, TEXT("FRTSPStreamerImpl::Start failed; RTSP stream unavailable."));
+		delete StreamerImpl;
+		StreamerImpl = nullptr;
+	}
+}
+
+void AStreamManagerRTSP::EndPlay(const EEndPlayReason::Type EndPlayReason)
+{
+	// Drain pending render requests so their fences complete before teardown.
+	while (!RenderRequestQueue.IsEmpty())
+	{
+		FRenderRequestStreamRTSPStruct* Request = nullptr;
+		RenderRequestQueue.Dequeue(Request);
+		if (Request)
+		{
+			Request->RenderFence.Wait();
+			delete Request;
+			QueueSize--;
+		}
+	}
+
+	CachedOverlayPixels.Empty();
+	if (WidgetRenderer)
+	{
+		delete WidgetRenderer;
+		WidgetRenderer = nullptr;
+	}
+	OverlayWidgets.Empty();
+	CompositeOverlaySlate.Reset();
+
+	if (StreamerImpl)
+	{
+		StreamerImpl->Stop();
+		delete StreamerImpl;
+		StreamerImpl = nullptr;
+	}
+
+	Super::EndPlay(EndPlayReason);
+}
+
+bool AStreamManagerRTSP::HasClient() const
+{
+	return StreamerImpl != nullptr && StreamerImpl->HasClient();
+}
+
+void AStreamManagerRTSP::Tick(float DeltaTime)
+{
+	Super::Tick(DeltaTime);
+
+	// ── Self-driven capture cadence ──────────────────────────────────────────
+	// Only burn GPU on readback while a client is actually watching.
+	const float Interval = 1.0f / FMath::Max(1, TargetFPS);
+	if (HasClient())
+	{
+		CaptureAccumulator += DeltaTime;
+		// Cap to avoid a capture storm after a long hitch.
+		if (CaptureAccumulator > Interval * 4.0f)
+		{
+			CaptureAccumulator = Interval;
+		}
+		if (CaptureAccumulator >= Interval)
+		{
+			CaptureAccumulator -= Interval;
+			CaptureNonBlocking();
+		}
+	}
+	else
+	{
+		CaptureAccumulator = 0.0f;
+	}
+
+	// ── Queue overflow guard (memory-leak protection) ─────────────────────────
+	if (QueueSize.load() > 10)
+	{
+		UE_LOG(LogStreamRTSP, Error, TEXT("RenderRequestQueue overflow (size=%d); draining."), QueueSize.load());
+		while (!RenderRequestQueue.IsEmpty())
+		{
+			FRenderRequestStreamRTSPStruct* Request = nullptr;
+			RenderRequestQueue.Dequeue(Request);
+			if (Request) { delete Request; QueueSize--; }
+		}
+		return;
+	}
+
+	if (RenderRequestQueue.IsEmpty())
+	{
+		return;
+	}
+
+	// ── Keep only the newest completed readback; discard stale ones ───────────
+	FRenderRequestStreamRTSPStruct* LatestReady = nullptr;
+	while (!RenderRequestQueue.IsEmpty())
+	{
+		FRenderRequestStreamRTSPStruct* Candidate = nullptr;
+		RenderRequestQueue.Peek(Candidate);
+		if (!Candidate) break;
+		if (!Candidate->RenderFence.IsFenceComplete()) break;  // still GPU-pending
+
+		RenderRequestQueue.Pop();
+		QueueSize--;
+
+		if (LatestReady) { delete LatestReady; }
+		LatestReady = Candidate;
+	}
+
+	if (!LatestReady)
+	{
+		return;
+	}
+
+	// ── Alpha-composite overlay onto the scene image ──────────────────────────
+	if (LatestReady->bHasOverlay &&
+		LatestReady->OverlayImage.Num() == LatestReady->Image.Num())
+	{
+		if (OverlayRefreshInterval > 1 &&
+			LatestReady->OverlayImage.GetData() != CachedOverlayPixels.GetData())
+		{
+			CachedOverlayPixels = LatestReady->OverlayImage;
+		}
+
+		const int32   PixelCount  = LatestReady->Image.Num();
+		FColor*       SceneData   = LatestReady->Image.GetData();
+		const FColor* OverlayData = LatestReady->OverlayImage.GetData();
+
+		for (int32 i = 0; i < PixelCount; ++i)
+		{
+			const uint8 A = OverlayData[i].A;
+			if (A == 0) continue;
+			if (A == 255)
+			{
+				SceneData[i] = OverlayData[i];
+			}
+			else
+			{
+				const uint32 InvA = 255 - A;
+				SceneData[i].R = (uint8)((OverlayData[i].R * A + SceneData[i].R * InvA + 127) / 255);
+				SceneData[i].G = (uint8)((OverlayData[i].G * A + SceneData[i].G * InvA + 127) / 255);
+				SceneData[i].B = (uint8)((OverlayData[i].B * A + SceneData[i].B * InvA + 127) / 255);
+				SceneData[i].A = 255;
+			}
+		}
+	}
+
+	// ── Push the BGRA frame into the GStreamer appsrc ─────────────────────────
+	// FColor is laid out B,G,R,A in memory → matches the appsrc "BGRA" caps.
+	if (StreamerImpl && LatestReady->Image.Num() > 0)
+	{
+		StreamerImpl->PushFrame(
+			reinterpret_cast<const uint8_t*>(LatestReady->Image.GetData()),
+			LatestReady->Image.Num() * (int32)sizeof(FColor));
+		FrameCounter++;
+	}
+
+	delete LatestReady;
+}
+
+void AStreamManagerRTSP::SetupCaptureComponent()
+{
+	if (!IsValid(CaptureComponent))
+	{
+		UE_LOG(LogStreamRTSP, Error, TEXT("SetupCaptureComponent: CaptureComponent is not valid!"));
+		return;
+	}
+
+	UTextureRenderTarget2D* RenderTarget2D = NewObject<UTextureRenderTarget2D>(this);
+	RenderTarget2D->RenderTargetFormat = ETextureRenderTargetFormat::RTF_RGBA8;
+	RenderTarget2D->InitCustomFormat(FrameWidth, FrameHeight, PF_B8G8R8A8, true); // LDR, no HDR overhead
+	RenderTarget2D->bGPUSharedFlag = true;
+
+	USceneCaptureComponent2D* Capture = CaptureComponent->GetCaptureComponent2D();
+	Capture->TextureTarget = RenderTarget2D;
+	Capture->CaptureSource = ESceneCaptureSource::SCS_FinalColorLDR;
+	Capture->TextureTarget->TargetGamma = GEngine->GetDisplayGamma();
+	Capture->ShowFlags.SetTemporalAA(true);
+	// RTSP is now the sole consumer of this capture; ensure it renders each frame.
+	Capture->bCaptureEveryFrame = true;
+
+	UE_LOG(LogStreamRTSP, Verbose, TEXT("RTSP capture render target initialised (%dx%d)"), FrameWidth, FrameHeight);
+}
+
+void AStreamManagerRTSP::CaptureNonBlocking()
+{
+	if (!IsValid(CaptureComponent))
+	{
+		UE_LOG(LogStreamRTSP, Error, TEXT("CaptureNonBlocking: CaptureComponent was not valid!"));
+		return;
+	}
+
+	if (QueueSize.load() > 5)
+	{
+		UE_LOG(LogStreamRTSP, Verbose, TEXT("CaptureNonBlocking: skipping, queue size %d"), QueueSize.load());
+		return;
+	}
+
+	USceneCaptureComponent2D* Capture = CaptureComponent->GetCaptureComponent2D();
+	Capture->TextureTarget->TargetGamma = GEngine->GetDisplayGamma();
+
+	FTextureRenderTargetResource* RenderTargetResource = Capture->TextureTarget->GameThread_GetRenderTargetResource();
+
+	struct FReadSurfaceContext
+	{
+		FRenderTarget*          SrcRenderTarget;
+		TArray<FColor>*         OutData;
+		FIntRect                Rect;
+		FReadSurfaceDataFlags   Flags;
+	};
+
+	FRenderRequestStreamRTSPStruct* RenderRequest = new FRenderRequestStreamRTSPStruct();
+
+	// ── Overlay: draw every frame (cheap), throttle GPU readback ──────────────
+	bool bFreshOverlayRender = false;
+	if (CompositeOverlaySlate.IsValid() && WidgetRenderer != nullptr && OverlayRenderTarget)
+	{
+		FTextureRenderTargetResource* OverlayResource = OverlayRenderTarget->GameThread_GetRenderTargetResource();
+		if (OverlayResource)
+		{
+			WidgetRenderer->DrawWidget(OverlayResource, CompositeOverlaySlate.ToSharedRef(),
+				FVector2D(FrameWidth, FrameHeight), GetWorld()->GetDeltaSeconds());
+
+			OverlayDrawCount++;
+			OverlayFrameCounter++;
+			if (OverlayFrameCounter >= OverlayRefreshInterval)
+			{
+				OverlayFrameCounter = 0;
+				bFreshOverlayRender = true;
+				RenderRequest->bHasOverlay = true;
+			}
+			else if (CachedOverlayPixels.Num() > 0)
+			{
+				RenderRequest->OverlayImage = CachedOverlayPixels;
+				RenderRequest->bHasOverlay = true;
+			}
+		}
+	}
+
+	FReadSurfaceContext ReadSurfaceContext = {
+		RenderTargetResource,
+		&(RenderRequest->Image),
+		FIntRect(0, 0, RenderTargetResource->GetSizeXY().X, RenderTargetResource->GetSizeXY().Y),
+		FReadSurfaceDataFlags(RCM_UNorm, CubeFace_MAX)
+	};
+
+	ENQUEUE_RENDER_COMMAND(RTSPSceneReadback)(
+		[ReadSurfaceContext](FRHICommandListImmediate& RHICmdList)
+		{
+			RHICmdList.ReadSurfaceData(
+				ReadSurfaceContext.SrcRenderTarget->GetRenderTargetTexture(),
+				ReadSurfaceContext.Rect,
+				*ReadSurfaceContext.OutData,
+				ReadSurfaceContext.Flags);
+		});
+
+	if (bFreshOverlayRender)
+	{
+		FTextureRenderTargetResource* OverlayResource = OverlayRenderTarget->GameThread_GetRenderTargetResource();
+		FReadSurfaceContext OverlayContext = {
+			OverlayResource,
+			&(RenderRequest->OverlayImage),
+			FIntRect(0, 0, OverlayResource->GetSizeXY().X, OverlayResource->GetSizeXY().Y),
+			FReadSurfaceDataFlags(RCM_UNorm, CubeFace_MAX)
+		};
+
+		ENQUEUE_RENDER_COMMAND(RTSPOverlayReadback)(
+			[OverlayContext](FRHICommandListImmediate& RHICmdList)
+			{
+				RHICmdList.ReadSurfaceData(
+					OverlayContext.SrcRenderTarget->GetRenderTargetTexture(),
+					OverlayContext.Rect,
+					*OverlayContext.OutData,
+					OverlayContext.Flags);
+			});
+	}
+
+	RenderRequestQueue.Enqueue(RenderRequest);
+	QueueSize++;
+	RenderRequest->RenderFence.BeginFence();
+}
+
+void AStreamManagerRTSP::SetStreamResolution(int32 NewWidth, int32 NewHeight)
+{
+	// H.264 requires even dimensions; clamp to sane bounds.
+	NewWidth  = FMath::Clamp(NewWidth  & ~1, 16, 7680);
+	NewHeight = FMath::Clamp(NewHeight & ~1, 16, 4320);
+
+	if (NewWidth == FrameWidth && NewHeight == FrameHeight)
+	{
+		return;
+	}
+
+	UE_LOG(LogStreamRTSP, Log, TEXT("Stream resolution %dx%d -> %dx%d"),
+		FrameWidth, FrameHeight, NewWidth, NewHeight);
+
+	// 1) Discard in-flight readbacks while the render target is still the old size
+	//    (their FIntRect matches the current target, so no out-of-bounds read).
+	DrainRenderQueue();
+
+	// 2) Resize the capture (and overlay) render targets to the new size.
+	FrameWidth  = NewWidth;
+	FrameHeight = NewHeight;
+	UpdateRenderTargetAfterFrameSizeChanged();
+
+	// 3) Renegotiate the live RTSP caps (keeps the session alive; player recovers).
+	if (StreamerImpl)
+	{
+		StreamerImpl->SetResolution(NewWidth, NewHeight);
+	}
+}
+
+void AStreamManagerRTSP::DrainRenderQueue()
+{
+	while (!RenderRequestQueue.IsEmpty())
+	{
+		FRenderRequestStreamRTSPStruct* Request = nullptr;
+		RenderRequestQueue.Dequeue(Request);
+		if (Request)
+		{
+			Request->RenderFence.Wait();
+			delete Request;
+			QueueSize--;
+		}
+	}
+	CachedOverlayPixels.Empty();   // old-size overlay cache is no longer valid
+}
+
+void AStreamManagerRTSP::UpdateRenderTargetAfterFrameSizeChanged()
+{
+	if (!IsValid(CaptureComponent))
+	{
+		UE_LOG(LogStreamRTSP, Error, TEXT("UpdateRenderTargetAfterFrameSizeChanged: CaptureComponent is not valid!"));
+		return;
+	}
+
+	CaptureComponent->GetCaptureComponent2D()->TextureTarget->InitCustomFormat(FrameWidth, FrameHeight, PF_B8G8R8A8, true);
+
+	if (CompositeOverlaySlate.IsValid())
+	{
+		if (!OverlayRenderTarget)
+		{
+			OverlayRenderTarget = NewObject<UTextureRenderTarget2D>(this);
+		}
+		OverlayRenderTarget->RenderTargetFormat = ETextureRenderTargetFormat::RTF_RGBA8;
+		OverlayRenderTarget->ClearColor = FLinearColor::Transparent;
+		OverlayRenderTarget->bGPUSharedFlag = true;
+		OverlayRenderTarget->InitCustomFormat(FrameWidth, FrameHeight, PF_B8G8R8A8, true);
+	}
+}
+
+void AStreamManagerRTSP::SetOverlayWidget(UUserWidget* InWidget)
+{
+	// Back-compat single-overlay convenience: replace whatever is there.
+	ClearOverlayWidgets();
+	if (InWidget)
+	{
+		AddOverlayWidget(InWidget);
+	}
+}
+
+void AStreamManagerRTSP::AddOverlayWidget(UUserWidget* InWidget)
+{
+	if (!InWidget || OverlayWidgets.Contains(InWidget))
+	{
+		return;
+	}
+	OverlayWidgets.Add(InWidget);
+	EnsureOverlayResources();
+	RebuildCompositeOverlay();
+	UE_LOG(LogStreamRTSP, Verbose, TEXT("Overlay added (%d total)"), OverlayWidgets.Num());
+}
+
+void AStreamManagerRTSP::RemoveOverlayWidget(UUserWidget* InWidget)
+{
+	if (InWidget && OverlayWidgets.Remove(InWidget) > 0)
+	{
+		RebuildCompositeOverlay();
+		UE_LOG(LogStreamRTSP, Verbose, TEXT("Overlay removed (%d left)"), OverlayWidgets.Num());
+	}
+}
+
+void AStreamManagerRTSP::ClearOverlayWidgets()
+{
+	OverlayWidgets.Empty();
+	CompositeOverlaySlate.Reset();
+}
+
+void AStreamManagerRTSP::EnsureOverlayResources()
+{
+	if (!WidgetRenderer)
+	{
+		WidgetRenderer = new FWidgetRenderer(/*bUseGammaCorrection=*/true);
+	}
+	if (!OverlayRenderTarget)
+	{
+		OverlayRenderTarget = NewObject<UTextureRenderTarget2D>(this);
+		OverlayRenderTarget->RenderTargetFormat = ETextureRenderTargetFormat::RTF_RGBA8;
+		OverlayRenderTarget->ClearColor = FLinearColor::Transparent;
+		OverlayRenderTarget->bGPUSharedFlag = true;
+		OverlayRenderTarget->InitCustomFormat(FrameWidth, FrameHeight, PF_B8G8R8A8, true);
+	}
+}
+
+void AStreamManagerRTSP::RebuildCompositeOverlay()
+{
+	// Drop any widgets that were GC'd.
+	OverlayWidgets.RemoveAll([](UUserWidget* W) { return !IsValid(W); });
+
+	if (OverlayWidgets.Num() == 0)
+	{
+		CompositeOverlaySlate.Reset();
+		return;
+	}
+
+	// Stack every overlay into one SOverlay so a single DrawWidget pass
+	// composites them all (add order = z-order; later widgets draw on top).
+	TSharedRef<SOverlay> Composite = SNew(SOverlay);
+	for (UUserWidget* W : OverlayWidgets)
+	{
+		Composite->AddSlot()
+		[
+			W->TakeWidget()
+		];
+	}
+	CompositeOverlaySlate = Composite;
+}
