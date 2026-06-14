@@ -1,6 +1,6 @@
 # ScreenStreamRTSPPlugin
 
-**Version:** 1.0.0  
+**Version:** 1.1.0  
 **Engine Version:** Unreal Engine 5.5+ (developed on 5.7)  
 **Platforms:** Win64, Linux  
 **License:** MIT License
