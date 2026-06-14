@@ -22,7 +22,9 @@ reuses the same SceneCapture front-end.
 
 - Real-time `SceneCapture2D` capture → H.264 → **RTSP** (`rtsp://host:8554/cam0`)
 - **Embedded RTSP server** (GStreamer `gst-rtsp-server`) — self-contained, no proxy
-- Hardware (**NVENC** `nvh264enc`) or software (`x264enc`) encoding, selectable
+- Hardware (**NVENC**) or software (`x264enc`) encoding, selectable; the NVENC variant
+  is auto-picked (`nvautogpuh264enc` → `nvcudah264enc` → `nvh264enc`) with automatic
+  fallback to `x264enc` when no NVENC factory is available (e.g. GPU-less host)
 - **Multiple UMG/Slate overlays** composited into the stream (stacked, add-order = z-order)
 - **Runtime resolution change** via in-place caps renegotiation (the session stays up;
   the player recovers automatically after a brief glitch)
@@ -46,7 +48,7 @@ This plugin links GStreamer (core, `app`, `rtsp-server`, `rtp`). Install the
    `…\msvc_x86_64\bin` to `PATH`. The `Build.cs` reads that variable; the editor
    needs `bin` on `PATH` at runtime. Restart the IDE/editor after changing them.
 
-### Ubuntu 24.04 / Linux
+### Ubuntu 24.04 / Linux (native build)
 
 ```bash
 sudo apt install -y \
@@ -55,10 +57,69 @@ sudo apt install -y \
   gstreamer1.0-plugins-ugly gstreamer1.0-libav pkg-config
 # NVENC (nvh264enc) lives in gstreamer1.0-plugins-bad (nvcodec) and needs the NVIDIA driver.
 ```
-`Build.cs` resolves include/lib paths via `pkg-config` on Linux (with a hardcoded
-fallback for the stock `/usr/lib/x86_64-linux-gnu` layout).
+When building **on** Linux, `Build.cs` resolves include/lib paths via `pkg-config`
+(with a hardcoded fallback for the stock `/usr/lib/x86_64-linux-gnu` layout) — these
+`-dev` packages are all it needs.
 
 > Verify the encoders are present: `gst-inspect-1.0 x264enc` and `gst-inspect-1.0 nvh264enc`.
+
+### Cross-compiling for Linux from a Windows host
+
+A Windows machine cannot use `pkg-config` or `/usr` to find the Linux GStreamer, so
+for a cross-compiled Linux target the plugin links against a **prebuilt GStreamer tree
+bundled inside the plugin** at `ThirdParty/GStreamerLinux/`. `Build.cs` auto-detects it
+(priority 1, ahead of `pkg-config`); if you cross-compile without it the build fails
+loudly with the path it expected.
+
+GStreamer/GLib are **pure C** — their public ABI is C (glibc), not C++ — so the stock
+Ubuntu `.so` files link cleanly from Unreal's clang/libc++ toolchain. No libc++ rebuild
+and no custom toolchain image are needed: just extract the dev libs from an Ubuntu 24.04
+install. Expected layout:
+
+```
+ThirdParty/GStreamerLinux/
+  VERSION                                  # e.g. 1.24.2-ubuntu24.04 (informational)
+  include/
+    gstreamer-1.0/                         # gst/*.h
+    glib-2.0/                              # glib.h, gobject/*, ...
+  lib/
+    libgstreamer-1.0.so  libgstapp-1.0.so  libgstrtspserver-1.0.so
+    libgstrtp-1.0.so     libgobject-2.0.so libglib-2.0.so
+    glib-2.0/include/glibconfig.h          # generated GLib config header
+```
+
+> The bundle is **not** committed — `ThirdParty/` is git-ignored (third-party binaries
+> are not vendored). Each developer/CI produces it once per GStreamer revision.
+
+**Producing the bundle from Ubuntu 24.04** (run on a Linux box, in WSL, or in a
+throwaway `ubuntu:24.04` Docker container — no NVIDIA/GPU needed, dev headers only):
+
+```bash
+apt-get update
+apt-get install -y libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev \
+                   libgstrtspserver-1.0-dev libglib2.0-dev
+
+mkdir -p out/include out/lib/glib-2.0/include
+# Headers
+cp -r /usr/include/gstreamer-1.0 out/include/
+cp -r /usr/include/glib-2.0      out/include/
+cp /usr/lib/x86_64-linux-gnu/glib-2.0/include/glibconfig.h out/lib/glib-2.0/include/
+# Core libraries — copy the real object (follow the symlink) as lib<name>.so.
+# The linker records each .so's embedded SONAME (libgstreamer-1.0.so.0, ...) as the
+# runtime DT_NEEDED regardless of the on-disk name, so lib<name>.so is enough to link.
+for n in gstreamer-1.0 gstapp-1.0 gstrtspserver-1.0 gstrtp-1.0 gobject-2.0 glib-2.0; do
+  cp -L "/usr/lib/x86_64-linux-gnu/lib$n.so" "out/lib/lib$n.so"
+done
+echo "$(gst-inspect-1.0 --version | awk '/version/{print $NF}')-ubuntu24.04" > out/VERSION
+```
+
+Then move `out/{include,lib,VERSION}` into `ThirdParty/GStreamerLinux/` on the Windows
+host (e.g. copy the folder out of WSL/Docker, or `tar -xzf` it there — `tar` ships with
+Windows 10+). `Build.cs` picks it up automatically on the next cross-build.
+
+> The bundle only satisfies **link time**. The deployed Ubuntu box still needs the real
+> GStreamer libraries and element plugins installed at runtime — see
+> [Packaged / deployed builds](#packaged--deployed-builds).
 
 ## Installation
 
@@ -154,7 +215,7 @@ S->bUseHardwareEncoder  = true;
 | `FrameWidth` / `FrameHeight` | int32 | 1920 / 1080 | Capture + stream resolution |
 | `TargetFPS` | int32 | 30 | Capture/stream frame rate |
 | `TargetBitrateKbps` | int32 | 8000 | Encoder target bitrate (kbps) |
-| `bUseHardwareEncoder` | bool | true | NVENC (`nvh264enc`) vs `x264enc` |
+| `bUseHardwareEncoder` | bool | true | NVENC (auto-picked, see Features) vs `x264enc` |
 | `CaptureComponent` | ASceneCapture2D* | null | Scene Capture 2D to stream |
 | `OverlayRefreshInterval` | int32 | 1 | Overlay GPU readback frequency (frames) |
 | `VerboseLogging` | bool | false | Verbose log output |
@@ -164,20 +225,59 @@ S->bUseHardwareEncoder  = true;
 - **Build error: "GStreamer not found … GSTREAMER_1_0_ROOT_MSVC_X86_64"** — install the
   MSVC *development* runtime and restart the IDE so it inherits the variable.
 - **Editor can't load `gst*-1.0-0.dll`** — add `…\msvc_x86_64\bin` to `PATH`, restart.
-- **Log: "no element x264enc/nvh264enc"** — set `GST_PLUGIN_PATH` to
-  `…\msvc_x86_64\lib\gstreamer-1.0` and restart (usually auto-resolved).
+- **Log: "no element x264enc/nvh264enc" or "appsrc 'src' not found"** — the element
+  plugins (`lib/gstreamer-1.0`) aren't on the search path. The plugin resolves this
+  automatically (staged folder, then `GSTREAMER_1_0_ROOT_MSVC_X86_64`); if it still
+  fails, set `GST_PLUGIN_PATH` to `…\msvc_x86_64\lib\gstreamer-1.0` and restart.
 - **`gst_rtsp_server_attach failed (port in use)`** — change `ServerPort`.
 - **Black / no frames** — ensure the `SceneCapture2D` renders each frame
   (`bCaptureEveryFrame`); the plugin sets it, but a custom capture setup may override it.
-- **NVENC errors / no NVIDIA GPU** — set `bUseHardwareEncoder = false` (`x264enc`).
+- **NVENC errors / no NVIDIA GPU** — the producer auto-falls back to `x264enc` when no
+  NVENC factory is found; force software with `bUseHardwareEncoder = false`. Legacy
+  `nvh264enc` may fail at runtime on recent drivers (5xx+) with *"Selected preset not
+  supported"* — the encoder auto-selection prefers `nvautogpuh264enc`/`nvcudah264enc`
+  to avoid that.
 - **Logs** — `Log LogStreamRTSP Verbose` in the console.
 
-## Packaged builds
+## Packaged / deployed builds
 
-`Build.cs` stages the GStreamer `bin\*.dll` next to the executable on Windows, but the
-GStreamer **plugins** (`lib/gstreamer-1.0`) are not yet bundled. For a packaged build,
-install the GStreamer runtime on the target machine (same version, `bin` on `PATH`), or
-extend the staging to include the plugin DLLs and set `GST_PLUGIN_PATH` at runtime.
+The linkable core libraries (`bin\*.dll` / `lib*.so`) are **not** the same files as the
+GStreamer *element factories* the pipeline needs at runtime (`appsrc`, `videoconvert`,
+`x264enc`, `nvh264enc`, `h264parse`, `rtph264pay`, ...). Those live in separate plugin
+modules under `lib/gstreamer-1.0`. If they are missing, the server registers zero plugins
+and media setup fails with `appsrc 'src' not found in pipeline`.
+
+### Windows (packaged game/server target)
+
+`Build.cs` stages, next to the executable:
+- the GStreamer `bin\*.dll` core libraries, **and**
+- the element plugins from `lib/gstreamer-1.0` into a sibling `gstreamer-1.0\` folder
+  (non-Editor targets only — the Editor falls back to the dev install via
+  `GSTREAMER_1_0_ROOT_MSVC_X86_64`, so it skips the ~110 MB per-build copy).
+
+At runtime `RTSPStreamerImpl.cpp` points `GST_PLUGIN_SYSTEM_PATH_1_0` at that staged
+`gstreamer-1.0\` folder (falling back to the dev install), so a packaged Windows build is
+self-contained — no GStreamer install required on the target.
+
+### Linux (deployed Ubuntu 24.04 target)
+
+A cross-compiled binary links against the bundle stubs only; the real `.so` files **and**
+the element plugins must be installed on the deploy box, or it won't even start
+(`error while loading shared libraries: libgstrtspserver-1.0.so.0`). Install the
+**runtime** packages (no `-dev` needed at runtime):
+
+```bash
+sudo apt update
+sudo apt install -y \
+  libgstreamer1.0-0 libgstreamer-plugins-base1.0-0 libgstrtspserver-1.0-0 \
+  gstreamer1.0-plugins-base gstreamer1.0-plugins-good \
+  gstreamer1.0-plugins-bad gstreamer1.0-plugins-ugly gstreamer1.0-libav gstreamer1.0-tools
+```
+
+> `libgstrtspserver-1.0-0` is **not** pulled in by the plugin metapackages — list it
+> explicitly. On Linux `libgstreamer` loads from `/usr/lib`, so plugin discovery is
+> native — the Windows `GST_PLUGIN_PATH` staging is a Windows-only concern. On a GPU-less
+> host the `nvh264enc` factory is absent and the producer auto-falls back to `x264enc`.
 
 ## Based on
 

@@ -72,3 +72,7 @@ Plugins/*/Intermediate/*
 
 # Cache files for the editor to use
 DerivedDataCache/*
+
+# Prebuilt third-party libraries are not vendored — produced per GStreamer revision
+# (Linux cross-compile bundle; see README "Cross-compiling for Linux from a Windows host").
+ThirdParty/

@@ -70,35 +70,79 @@ public class ScreenStreamRTSPPlugin : ModuleRules
 		}
 	}
 
-	// ── Linux: resolve flags via pkg-config, fall back to standard Ubuntu paths ──
+	// ── Linux: bundled ThirdParty (cross-compile) → pkg-config → /usr fallback ───
 	private void ConfigureLinux()
 	{
+		// Priority 1: a pre-built GStreamer tree bundled in the plugin. REQUIRED
+		// when cross-compiling for Linux from a Windows host (no pkg-config / /usr
+		// there); on a native Linux host it is used if present. Layout mirrors
+		// GatewaySDKPlugin/ThirdParty:
+		//   ThirdParty/GStreamerLinux/include/{gstreamer-1.0,glib-2.0}
+		//   ThirdParty/GStreamerLinux/lib/{libgstreamer-1.0.so,...,glib-2.0/include/glibconfig.h}
+		// GStreamer/GLib are pure C, so the stock Ubuntu .so link fine from UE's
+		// clang/libc++ target — the ABI boundary is C (glibc), not C++. Hence,
+		// unlike the gateway-cpp SDK, no libc++ rebuild is needed; extract the
+		// dev libs straight from an Ubuntu 24.04 install.
+		string tpDir = Path.Combine(ModuleDirectory, "..", "..", "ThirdParty", "GStreamerLinux");
+		string tpInc = Path.Combine(tpDir, "include");
+		string tpLib = Path.Combine(tpDir, "lib");
+		if (Directory.Exists(tpInc) && Directory.Exists(tpLib))
+		{
+			Console.WriteLine("ScreenStreamRTSPPlugin: using bundled GStreamer at " + tpDir);
+			PublicIncludePaths.AddRange(new string[]
+			{
+				Path.Combine(tpInc, "gstreamer-1.0"),
+				Path.Combine(tpInc, "glib-2.0"),
+				Path.Combine(tpLib, "glib-2.0", "include")   // glibconfig.h
+			});
+			foreach (string so in new string[]
+			{
+				"libgstreamer-1.0.so", "libgstapp-1.0.so", "libgstrtspserver-1.0.so",
+				"libgstrtp-1.0.so", "libgobject-2.0.so", "libglib-2.0.so"
+			})
+			{
+				PublicAdditionalLibraries.Add(Path.Combine(tpLib, so));
+			}
+			return;
+		}
+
+		// Priority 2: native Linux host — resolve flags via pkg-config.
 		bool ok = true;
 		foreach (string pkg in GstPackages)
 		{
 			ok &= ApplyPkgConfig(pkg);
 		}
-
-		if (!ok)
+		if (ok)
 		{
-			// Fallback for a stock Ubuntu 24.04 amd64 layout when pkg-config
-			// is unavailable in the build environment.
-			Console.WriteLine("ScreenStreamRTSPPlugin: pkg-config failed; using hardcoded Ubuntu paths.");
-			string archDir = "/usr/lib/x86_64-linux-gnu";
-			PublicIncludePaths.AddRange(new string[]
-			{
-				"/usr/include/gstreamer-1.0",
-				"/usr/include/glib-2.0",
-				Path.Combine(archDir, "glib-2.0/include")
-			});
-			foreach (string lib in new string[]
-			{
-				"gstreamer-1.0", "gstapp-1.0", "gstrtspserver-1.0",
-				"gstrtp-1.0", "gobject-2.0", "glib-2.0"
-			})
-			{
-				PublicSystemLibraries.Add(lib);
-			}
+			return;
+		}
+
+		// Cross-compiling from Windows with no bundle present → fail loudly; the
+		// /usr fallback below would point the linker at paths that don't exist.
+		if (BuildHostPlatform.Current.Platform == UnrealTargetPlatform.Win64)
+		{
+			throw new BuildException(
+				"Cross-compiling for Linux requires GStreamer prebuilt libs bundled at:\n  " +
+				tpDir + "\n(extract include/ + lib/ from an Ubuntu 24.04 install — see " +
+				"worldsim/Docs/RTSP_SETUP_AND_RUN.md §C).");
+		}
+
+		// Priority 3: native Linux without pkg-config — stock Ubuntu 24.04 paths.
+		Console.WriteLine("ScreenStreamRTSPPlugin: pkg-config failed; using hardcoded Ubuntu paths.");
+		string archDir = "/usr/lib/x86_64-linux-gnu";
+		PublicIncludePaths.AddRange(new string[]
+		{
+			"/usr/include/gstreamer-1.0",
+			"/usr/include/glib-2.0",
+			Path.Combine(archDir, "glib-2.0/include")
+		});
+		foreach (string lib in new string[]
+		{
+			"gstreamer-1.0", "gstapp-1.0", "gstrtspserver-1.0",
+			"gstrtp-1.0", "gobject-2.0", "glib-2.0"
+		})
+		{
+			PublicSystemLibraries.Add(lib);
 		}
 	}
 
@@ -203,6 +247,30 @@ public class ScreenStreamRTSPPlugin : ModuleRules
 			foreach (string dll in Directory.GetFiles(bin, "*.dll"))
 			{
 				RuntimeDependencies.Add("$(TargetOutputDir)/" + Path.GetFileName(dll), dll, StagedFileType.NonUFS);
+			}
+		}
+
+		// The bin/*.dll above are the linkable core *libraries*. The element
+		// *factories* the launch string needs (appsrc, videoconvert, x264enc,
+		// nvh264enc, h264parse, rtph264pay, ...) live in separate plugin modules
+		// under lib/gstreamer-1.0 (e.g. appsrc is in gstapp.dll there, not in
+		// bin/gstapp-1.0-0.dll). A packaged build must carry them or it registers
+		// zero plugins and media-configure fails with "appsrc 'src' not found".
+		// Stage them into a sibling "gstreamer-1.0" folder; RTSPStreamerImpl.cpp
+		// points GST_PLUGIN_SYSTEM_PATH_1_0 there at runtime.
+		//
+		// Skip this for the Editor: the whole plugin set is ~110 MB, and in the
+		// editor RTSPStreamerImpl.cpp's path resolution falls back to the dev
+		// install via GSTREAMER_1_0_ROOT_MSVC_X86_64 — no per-build copy needed.
+		if (Target.Type != TargetType.Editor)
+		{
+			string plugins = Path.Combine(lib, "gstreamer-1.0");
+			if (Directory.Exists(plugins))
+			{
+				foreach (string dll in Directory.GetFiles(plugins, "*.dll"))
+				{
+					RuntimeDependencies.Add("$(TargetOutputDir)/gstreamer-1.0/" + Path.GetFileName(dll), dll, StagedFileType.NonUFS);
+				}
 			}
 		}
 	}
