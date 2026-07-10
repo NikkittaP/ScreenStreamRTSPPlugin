@@ -1,6 +1,6 @@
 # ScreenStreamRTSPPlugin
 
-**Version:** 1.1.0  
+**Version:** 1.2.0  
 **Engine Version:** Unreal Engine 5.5+ (developed on 5.7)  
 **Platforms:** Win64, Linux  
 **License:** MIT License
@@ -18,10 +18,18 @@ It is the RTSP/H.264 sibling of
 [ScreenStreamMJPEGPlugin](https://github.com/NikkittaP/ScreenStreamMJPEGPlugin) and
 reuses the same SceneCapture front-end.
 
+Optionally, the same frames can also be published over **WebRTC** using **WHIP**
+(WebRTC-HTTP Ingestion Protocol) to any WHIP ingest endpoint (e.g. a LiveKit
+Ingress). This is additive and **off by default**, so RTSP is unaffected unless you
+turn it on — see [WebRTC / WHIP publishing](#webrtc--whip-publishing-optional).
+
 ## Features
 
 - Real-time `SceneCapture2D` capture → H.264 → **RTSP** (`rtsp://host:8554/cam0`)
 - **Embedded RTSP server** (GStreamer `gst-rtsp-server`) — self-contained, no proxy
+- **Optional WebRTC publishing** over **WHIP** (additive — RTSP keeps working): the same
+  frames go to any WHIP ingest (e.g. a LiveKit Ingress) via `whipclientsink`, which
+  auto-encodes H.264 and runs congestion control for adaptive bitrate
 - Hardware (**NVENC**) or software (`x264enc`) encoding, selectable; the NVENC variant
   is auto-picked (`nvautogpuh264enc` → `nvcudah264enc` → `nvh264enc`) with automatic
   fallback to `x264enc` when no NVENC factory is available (e.g. GPU-less host)
@@ -121,6 +129,23 @@ Windows 10+). `Build.cs` picks it up automatically on the next cross-build.
 > GStreamer libraries and element plugins installed at runtime — see
 > [Packaged / deployed builds](#packaged--deployed-builds).
 
+### WebRTC / WHIP (optional — only if you use `bEnableWebRtc`)
+
+WHIP publishing additionally needs the **`whipclientsink`** element (from
+[`gst-plugins-rs`](https://gitlab.freedesktop.org/gstreamer/gst-plugins-rs)) and the
+**`webrtcbin`** element it builds on (from `gst-plugins-bad`). Plain RTSP does **not**
+need either — if they are missing, WHIP start fails (logged) and RTSP is unaffected.
+
+- **Windows:** the official GStreamer 1.22+ MSVC *development* installer ships both.
+  Verify: `gst-inspect-1.0 whipclientsink` and `gst-inspect-1.0 webrtcbin`.
+- **Ubuntu/Linux:** `webrtcbin` comes with `gstreamer1.0-plugins-bad`; `whipclientsink`
+  ships in the Rust plugin set (`gstreamer1.0-plugins-rs` where packaged, or built from
+  `gst-plugins-rs`). Verify with the same two `gst-inspect-1.0` commands.
+
+> `webrtcbin` needs `libnice >= 0.1.23`. Some older/stripped distributions build
+> GStreamer's webrtc without a usable `nice` backend, in which case `webrtcbin` is absent
+> even though `whipclientsink` is present — verify **both** elements resolve.
+
 ## Installation
 
 1. Copy the `ScreenStreamRTSPPlugin` folder into your project's `Plugins` directory.
@@ -187,7 +212,44 @@ StreamManagerRTSP->AddOverlayWidget(Hud);
 `SetStreamResolution(NewWidth, NewHeight)` resizes the capture + stream in place: it
 renegotiates the live appsrc caps, the encoder emits a fresh keyframe, and connected
 players recover automatically after a short glitch (no reconnect). Dimensions are
-clamped and rounded to even (H.264 requirement). No-op when unchanged.
+clamped and rounded to even (H.264 requirement). No-op when unchanged. The change
+applies to the WebRTC/WHIP session too, if enabled.
+
+### WebRTC / WHIP publishing (optional)
+
+The same captured frames can be published over **WebRTC** using **WHIP**
+(WebRTC-HTTP Ingestion Protocol), *in addition* to RTSP. This is fully additive: RTSP
+keeps working exactly as before, and WebRTC stays off unless you enable it.
+
+Enable it on the `StreamManagerRTSP` actor:
+
+- `bEnableWebRtc` (default **false**) — turn on the WHIP publish.
+- `WhipUrl` — the full WHIP ingest URL **including the stream key**, e.g.
+  `http://host:8080/w/<STREAM_KEY>`. Empty disables the publish even when
+  `bEnableWebRtc` is `true`.
+
+```cpp
+S->bEnableWebRtc = true;
+S->WhipUrl       = TEXT("http://host:8080/w/<STREAM_KEY>");
+```
+
+Point `WhipUrl` at any WHIP-compatible ingest endpoint — for example a
+[LiveKit](https://livekit.io/) Ingress (its `provision.py` / `up.sh` prints the exact
+`http://host:8080/w/<KEY>` URL), or another WHIP server. Viewers subscribe on the
+media-server / SFU side; the plugin only publishes.
+
+Behaviour notes:
+
+- Unlike RTSP — which encodes only while a client is connected — the WHIP pipeline
+  publishes **continuously** while enabled (a WHIP ingest has no "client connected"
+  signal to gate on). `IsStreaming()` is `true` when an RTSP client is connected **or**
+  WHIP is publishing, and it drives the capture cadence and overlay refresh.
+- If `whipclientsink` / `webrtcbin` are missing, or the ingest rejects the connection,
+  WHIP fails and logs it — **RTSP is never affected**.
+- Pipeline: `appsrc(BGRA) → queue → videoconvert → whipclientsink`. `whipclientsink`
+  auto-encodes to H.264 and runs Google Congestion Control (adaptive bitrate), so the
+  plugin feeds it raw frames and never pre-encodes. See
+  [Requirements → WebRTC / WHIP](#webrtc--whip-optional--only-if-you-use-benablewebrtc).
 
 ### C++ quick reference
 
@@ -216,6 +278,8 @@ S->bUseHardwareEncoder  = true;
 | `TargetFPS` | int32 | 30 | Capture/stream frame rate |
 | `TargetBitrateKbps` | int32 | 8000 | Encoder target bitrate (kbps) |
 | `bUseHardwareEncoder` | bool | true | NVENC (auto-picked, see Features) vs `x264enc` |
+| `bEnableWebRtc` | bool | false | Also publish over WebRTC/WHIP (additive; RTSP untouched) |
+| `WhipUrl` | FString | (empty) | Full WHIP ingest URL incl. stream key, e.g. `http://host:8080/w/<KEY>` |
 | `CaptureComponent` | ASceneCapture2D* | null | Scene Capture 2D to stream |
 | `OverlayRefreshInterval` | int32 | 1 | Overlay GPU readback frequency (frames) |
 | `VerboseLogging` | bool | false | Verbose log output |
@@ -237,7 +301,13 @@ S->bUseHardwareEncoder  = true;
   `nvh264enc` may fail at runtime on recent drivers (5xx+) with *"Selected preset not
   supported"* — the encoder auto-selection prefers `nvautogpuh264enc`/`nvcudah264enc`
   to avoid that.
-- **Logs** — `Log LogStreamRTSP Verbose` in the console.
+- **Logs** — `Log LogStreamRTSP Verbose` in the console (WebRTC lines are tagged `[WHIP]`).
+- **WebRTC: "pipeline missing appsrc 'src' or 'whip' sink — is whipclientsink installed?"**
+  — `whipclientsink` (`gst-plugins-rs`) or `webrtcbin` (`gst-plugins-bad`) isn't installed
+  or isn't on the plugin search path (see [Requirements → WebRTC](#webrtc--whip-optional--only-if-you-use-benablewebrtc)). RTSP is unaffected.
+- **WebRTC: nothing appears at the viewer / "WHIP pipeline error … 503 … ICE"** — the WHIP
+  ingest isn't reachable or isn't provisioned: check `WhipUrl`, the ingest server, and that
+  the media UDP ports are open end-to-end. RTSP is unaffected.
 
 ## Packaged / deployed builds
 
