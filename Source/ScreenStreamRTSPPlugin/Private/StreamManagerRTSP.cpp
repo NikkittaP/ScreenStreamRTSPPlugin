@@ -3,6 +3,7 @@
 
 #include "StreamManagerRTSP.h"
 #include "RTSPStreamerImpl.h"
+#include "WhipStreamerImpl.h"
 
 DEFINE_LOG_CATEGORY(LogStreamRTSP);
 
@@ -30,6 +31,19 @@ static void RtspLogToUE(int Level, const char* Msg)
 		case 1:  UE_LOG(LogStreamRTSP, Warning, TEXT("%s"), *S); break;
 		case 3:  UE_LOG(LogStreamRTSP, Verbose, TEXT("%s"), *S); break;
 		default: UE_LOG(LogStreamRTSP, Log,     TEXT("%s"), *S); break;
+	}
+}
+
+// Same bridge for the WHIP streamer TU, tagged so the two are distinguishable.
+static void WhipLogToUE(int Level, const char* Msg)
+{
+	const FString S = UTF8_TO_TCHAR(Msg);
+	switch (Level)
+	{
+		case 2:  UE_LOG(LogStreamRTSP, Error,   TEXT("[WHIP] %s"), *S); break;
+		case 1:  UE_LOG(LogStreamRTSP, Warning, TEXT("[WHIP] %s"), *S); break;
+		case 3:  UE_LOG(LogStreamRTSP, Verbose, TEXT("[WHIP] %s"), *S); break;
+		default: UE_LOG(LogStreamRTSP, Log,     TEXT("[WHIP] %s"), *S); break;
 	}
 }
 
@@ -68,6 +82,30 @@ void AStreamManagerRTSP::BeginPlay()
 		delete StreamerImpl;
 		StreamerImpl = nullptr;
 	}
+
+	// ── Optional WebRTC/WHIP publish (additive; independent of RTSP clients) ──
+	if (bEnableWebRtc && !WhipUrl.IsEmpty())
+	{
+		FWhipStreamerImpl::SetLogCallback(&WhipLogToUE);
+		WhipStreamerImpl = new FWhipStreamerImpl();
+
+		FWhipStreamerImpl::FSettings WhipSettings;
+		WhipSettings.WhipEndpoint = TCHAR_TO_UTF8(*WhipUrl);
+		WhipSettings.Width        = FrameWidth;
+		WhipSettings.Height       = FrameHeight;
+		WhipSettings.Fps          = TargetFPS;
+
+		if (!WhipStreamerImpl->Start(WhipSettings))
+		{
+			UE_LOG(LogStreamRTSP, Error, TEXT("FWhipStreamerImpl::Start failed; WebRTC publish unavailable (RTSP still works)."));
+			delete WhipStreamerImpl;
+			WhipStreamerImpl = nullptr;
+		}
+	}
+	else if (bEnableWebRtc)
+	{
+		UE_LOG(LogStreamRTSP, Warning, TEXT("bEnableWebRtc is true but WhipUrl is empty; WebRTC publish skipped."));
+	}
 }
 
 void AStreamManagerRTSP::EndPlay(const EEndPlayReason::Type EndPlayReason)
@@ -101,6 +139,13 @@ void AStreamManagerRTSP::EndPlay(const EEndPlayReason::Type EndPlayReason)
 		StreamerImpl = nullptr;
 	}
 
+	if (WhipStreamerImpl)
+	{
+		WhipStreamerImpl->Stop();
+		delete WhipStreamerImpl;
+		WhipStreamerImpl = nullptr;
+	}
+
 	Super::EndPlay(EndPlayReason);
 }
 
@@ -109,14 +154,21 @@ bool AStreamManagerRTSP::HasClient() const
 	return StreamerImpl != nullptr && StreamerImpl->HasClient();
 }
 
+bool AStreamManagerRTSP::IsStreaming() const
+{
+	return HasClient() || (WhipStreamerImpl != nullptr && WhipStreamerImpl->IsRunning());
+}
+
 void AStreamManagerRTSP::Tick(float DeltaTime)
 {
 	Super::Tick(DeltaTime);
 
 	// ── Self-driven capture cadence ──────────────────────────────────────────
-	// Only burn GPU on readback while a client is actually watching.
+	// Only burn GPU on readback while someone needs the frames: an RTSP client is
+	// watching, OR the WHIP pipeline is publishing (it has no per-client gate).
+	const bool bNeedFrames = IsStreaming();
 	const float Interval = 1.0f / FMath::Max(1, TargetFPS);
-	if (HasClient())
+	if (bNeedFrames)
 	{
 		CaptureAccumulator += DeltaTime;
 		// Cap to avoid a capture storm after a long hitch.
@@ -207,13 +259,22 @@ void AStreamManagerRTSP::Tick(float DeltaTime)
 		}
 	}
 
-	// ── Push the BGRA frame into the GStreamer appsrc ─────────────────────────
+	// ── Push the BGRA frame into the GStreamer appsrc(s) ──────────────────────
 	// FColor is laid out B,G,R,A in memory → matches the appsrc "BGRA" caps.
-	if (StreamerImpl && LatestReady->Image.Num() > 0)
+	// The same buffer feeds both the RTSP and the WebRTC/WHIP pipelines.
+	if (LatestReady->Image.Num() > 0)
 	{
-		StreamerImpl->PushFrame(
-			reinterpret_cast<const uint8_t*>(LatestReady->Image.GetData()),
-			LatestReady->Image.Num() * (int32)sizeof(FColor));
+		const uint8_t* const Pixels = reinterpret_cast<const uint8_t*>(LatestReady->Image.GetData());
+		const int32 SizeBytes = LatestReady->Image.Num() * (int32)sizeof(FColor);
+
+		if (StreamerImpl)
+		{
+			StreamerImpl->PushFrame(Pixels, SizeBytes);
+		}
+		if (WhipStreamerImpl)
+		{
+			WhipStreamerImpl->PushFrame(Pixels, SizeBytes);
+		}
 		FrameCounter++;
 	}
 
@@ -365,10 +426,15 @@ void AStreamManagerRTSP::SetStreamResolution(int32 NewWidth, int32 NewHeight)
 	FrameHeight = NewHeight;
 	UpdateRenderTargetAfterFrameSizeChanged();
 
-	// 3) Renegotiate the live RTSP caps (keeps the session alive; player recovers).
+	// 3) Renegotiate the live caps on both pipelines (each session stays alive;
+	//    the player/viewer recovers on the forced keyframe).
 	if (StreamerImpl)
 	{
 		StreamerImpl->SetResolution(NewWidth, NewHeight);
+	}
+	if (WhipStreamerImpl)
+	{
+		WhipStreamerImpl->SetResolution(NewWidth, NewHeight);
 	}
 }
 

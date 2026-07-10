@@ -13,6 +13,7 @@ class UTextureRenderTarget2D;
 class FWidgetRenderer;
 class SWidget;
 class FRTSPStreamerImpl;
+class FWhipStreamerImpl;
 
 #include "CoreMinimal.h"
 #include "GameFramework/Actor.h"
@@ -69,6 +70,18 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Stream")
 	bool bUseHardwareEncoder = true;
 
+	/** Also publish the same frames over WebRTC/WHIP (additive; RTSP is untouched).
+	 *  Requires a non-empty WhipUrl. Unlike RTSP, the WHIP pipeline publishes
+	 *  continuously while enabled — there is no "client connected" gate. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Stream|WebRTC")
+	bool bEnableWebRtc = false;
+
+	/** Full WHIP ingest URL INCLUDING the stream key, e.g.
+	 *  http://host:8080/w/<STREAM_KEY> (from livekit-whip provision.py). Empty
+	 *  disables the WebRTC publish even when bEnableWebRtc is true. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Stream|WebRTC")
+	FString WhipUrl;
+
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Stream")
 	ASceneCapture2D* CaptureComponent = nullptr;
 
@@ -112,6 +125,12 @@ public:
 	UFUNCTION(BlueprintPure, Category = "Stream")
 	bool HasClient() const;
 
+	/** True while frames are needed by *any* consumer: an RTSP client is connected
+	 *  OR the WebRTC/WHIP pipeline is publishing (which has no per-client gate).
+	 *  Drives capture cadence and overlay refresh. */
+	UFUNCTION(BlueprintPure, Category = "Stream")
+	bool IsStreaming() const;
+
 protected:
 	virtual void BeginPlay() override;
 	virtual void EndPlay(const EEndPlayReason::Type EndPlayReason) override;
@@ -125,6 +144,11 @@ protected:
 	// UCLASS's generated destructor / vtable-helper ctor never needs the complete
 	// type. Created in BeginPlay, deleted in EndPlay.
 	FRTSPStreamerImpl* StreamerImpl = nullptr;
+
+	// Optional WebRTC/WHIP sibling streamer fed from the same captured frames.
+	// Same incomplete-type / raw-pointer reasoning as StreamerImpl. Created in
+	// BeginPlay only when bEnableWebRtc && !WhipUrl.IsEmpty(), deleted in EndPlay.
+	FWhipStreamerImpl* WhipStreamerImpl = nullptr;
 
 	// Completed-readback queue (newest frame wins; stale frames are dropped).
 	TQueue<FRenderRequestStreamRTSPStruct*> RenderRequestQueue;
