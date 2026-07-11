@@ -321,16 +321,16 @@ void AStreamManagerRTSP::Tick(float DeltaTime)
 		const int32 NumSinks  = (StreamerImpl ? 1 : 0) + (WhipStreamerImpl ? 1 : 0);
 		if (NumSinks > 0)
 		{
-			FSharedFrameOwner* Owner = new FSharedFrameOwner(MoveTemp(LatestReady->Image), NumSinks);
-			const uint8_t* const Pixels = reinterpret_cast<const uint8_t*>(Owner->Pixels.GetData());
+			FSharedFrameOwner* FrameOwner = new FSharedFrameOwner(MoveTemp(LatestReady->Image), NumSinks);
+			const uint8_t* const Pixels = reinterpret_cast<const uint8_t*>(FrameOwner->Pixels.GetData());
 
 			if (StreamerImpl)
 			{
-				StreamerImpl->PushFrameZeroCopy(Pixels, SizeBytes, Owner, &FSharedFrameOwner::Release);
+				StreamerImpl->PushFrameZeroCopy(Pixels, SizeBytes, FrameOwner, &FSharedFrameOwner::Release);
 			}
 			if (WhipStreamerImpl)
 			{
-				WhipStreamerImpl->PushFrameZeroCopy(Pixels, SizeBytes, Owner, &FSharedFrameOwner::Release);
+				WhipStreamerImpl->PushFrameZeroCopy(Pixels, SizeBytes, FrameOwner, &FSharedFrameOwner::Release);
 			}
 			FrameCounter++;
 		}
