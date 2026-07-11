@@ -33,6 +33,10 @@ struct FRenderRequestStreamRTSPStruct
 	TArray<FColor>      Image;
 	TArray<FColor>      OverlayImage;
 	bool                bHasOverlay = false;
+	/** True when OverlayImage was freshly read back for this request (not cached). */
+	bool                bFreshOverlay = false;
+	/** Overlay pixels shared from the manager's cache — a ref, not a per-frame copy. */
+	TSharedPtr<const TArray<FColor>, ESPMode::ThreadSafe> CachedOverlay;
 	FRenderCommandFence RenderFence;
 
 	FRenderRequestStreamRTSPStruct() {}
@@ -166,7 +170,9 @@ protected:
 	UPROPERTY()
 	TArray<UUserWidget*> OverlayWidgets;
 	TSharedPtr<SWidget>  CompositeOverlaySlate;   // SOverlay wrapping OverlayWidgets
-	TArray<FColor>       CachedOverlayPixels;
+	// Last fresh overlay readback, shared with in-flight render requests
+	// (TSharedPtr: compositing may consume it a few frames later).
+	TSharedPtr<const TArray<FColor>, ESPMode::ThreadSafe> CachedOverlayShared;
 	int32 OverlayFrameCounter = 0;
 	int32 OverlayDrawCount = 0;
 

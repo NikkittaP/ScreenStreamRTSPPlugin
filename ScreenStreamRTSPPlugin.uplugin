@@ -1,7 +1,7 @@
 {
 	"FileVersion": 3,
 	"Version": 3,
-	"VersionName": "1.2.0",
+	"VersionName": "1.3.0",
 	"FriendlyName": "ScreenStreamRTSPPlugin",
 	"Description": "Captures a SceneCapture2D view, H.264-encodes it and serves it over RTSP via an embedded GStreamer rtsp-server, with optional additive WebRTC/WHIP publishing. Sibling of ScreenStreamMJPEGPlugin.",
 	"Category": "Streaming",

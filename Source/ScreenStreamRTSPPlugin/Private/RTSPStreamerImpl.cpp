@@ -266,7 +266,7 @@ static std::string BuildLaunchString(const FRTSPStreamerImpl::FSettings& S)
 	std::snprintf(Launch, sizeof(Launch),
 		"( appsrc name=src is-live=true do-timestamp=false format=time "
 		"caps=video/x-raw,format=BGRA,width=%d,height=%d,framerate=%d/1 "
-		"! queue max-size-buffers=3 leaky=downstream ! videoconvert ! %s "
+		"! queue max-size-buffers=3 leaky=downstream ! videoconvert n-threads=2 ! %s "
 		"! rtph264pay name=pay0 pt=96 config-interval=1 )",
 		S.Width, S.Height, Fps, Encoder);
 
@@ -451,6 +451,46 @@ void FRTSPStreamerImpl::PushFrame(const uint8_t* Bgra, int32_t SizeBytes)
 		return;
 	}
 	gst_buffer_fill(Buffer, 0, Bgra, SizeBytes);
+
+	const int Fps = std::max(1, P->Settings.Fps);
+	GST_BUFFER_PTS(Buffer)      = gst_util_uint64_scale(P->FrameCount, GST_SECOND, Fps);
+	GST_BUFFER_DURATION(Buffer) = gst_util_uint64_scale(1, GST_SECOND, Fps);
+	P->FrameCount++;
+
+	const GstFlowReturn Ret = gst_app_src_push_buffer(GST_APP_SRC(P->AppSrc), Buffer);
+	if (Ret != GST_FLOW_OK && Ret != GST_FLOW_FLUSHING)
+	{
+		LogMsg(3, "appsrc push-buffer returned %d", (int)Ret);
+	}
+}
+
+void FRTSPStreamerImpl::PushFrameZeroCopy(const uint8_t* Bgra, int32_t SizeBytes,
+                                          void* Owner, void (*ReleaseOwner)(void*))
+{
+	if (!P || !Bgra || SizeBytes <= 0)
+	{
+		if (Owner && ReleaseOwner) { ReleaseOwner(Owner); }
+		return;
+	}
+
+	std::lock_guard<std::mutex> Lock(P->AppSrcMutex);
+	if (!P->AppSrc)
+	{
+		if (Owner && ReleaseOwner) { ReleaseOwner(Owner); }
+		return;   // no client connected yet → media (and appsrc) not built
+	}
+
+	// Wrap the caller's memory read-only; GStreamer calls ReleaseOwner when the
+	// last ref of this buffer is dropped (downstream copies on convert anyway).
+	GstBuffer* Buffer = gst_buffer_new_wrapped_full(
+		GST_MEMORY_FLAG_READONLY,
+		const_cast<uint8_t*>(Bgra), SizeBytes, 0, SizeBytes,
+		Owner, ReleaseOwner);
+	if (!Buffer)
+	{
+		if (Owner && ReleaseOwner) { ReleaseOwner(Owner); }
+		return;
+	}
 
 	const int Fps = std::max(1, P->Settings.Fps);
 	GST_BUFFER_PTS(Buffer)      = gst_util_uint64_scale(P->FrameCount, GST_SECOND, Fps);

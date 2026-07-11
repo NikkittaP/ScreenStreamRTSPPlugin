@@ -16,6 +16,30 @@ DEFINE_LOG_CATEGORY(LogStreamRTSP);
 
 #include "RHICommandList.h"
 #include "RenderingThread.h"
+#include "Async/ParallelFor.h"
+
+#include <atomic>
+
+// Refcounted owner of one finished BGRA frame. The pixel array is MOVED in and
+// wrapped zero-copy into one GstBuffer per pipeline (RTSP / WHIP); each pipeline
+// releases its reference from its own streaming thread when the buffer is freed.
+struct FSharedFrameOwner
+{
+	TArray<FColor>     Pixels;
+	std::atomic<int32> RefCount;
+
+	FSharedFrameOwner(TArray<FColor>&& InPixels, int32 InRefs)
+		: Pixels(MoveTemp(InPixels)), RefCount(InRefs) {}
+
+	static void Release(void* Opaque)
+	{
+		FSharedFrameOwner* Owner = static_cast<FSharedFrameOwner*>(Opaque);
+		if (Owner->RefCount.fetch_sub(1, std::memory_order_acq_rel) == 1)
+		{
+			delete Owner;
+		}
+	}
+};
 
 #include "Slate/WidgetRenderer.h"
 #include "Blueprint/UserWidget.h"
@@ -123,7 +147,7 @@ void AStreamManagerRTSP::EndPlay(const EEndPlayReason::Type EndPlayReason)
 		}
 	}
 
-	CachedOverlayPixels.Empty();
+	CachedOverlayShared.Reset();
 	if (WidgetRenderer)
 	{
 		delete WidgetRenderer;
@@ -167,6 +191,21 @@ void AStreamManagerRTSP::Tick(float DeltaTime)
 	// Only burn GPU on readback while someone needs the frames: an RTSP client is
 	// watching, OR the WHIP pipeline is publishing (it has no per-client gate).
 	const bool bNeedFrames = IsStreaming();
+
+	// Gate the SceneCapture render itself, not just the readback: with
+	// bCaptureEveryFrame stuck on, the capture costs a full extra scene render
+	// per engine frame even with zero consumers (measured: "idle" ~= "rtsp").
+	if (IsValid(CaptureComponent))
+	{
+		if (USceneCaptureComponent2D* Capture = CaptureComponent->GetCaptureComponent2D())
+		{
+			if (Capture->bCaptureEveryFrame != bNeedFrames)
+			{
+				Capture->bCaptureEveryFrame = bNeedFrames;
+			}
+		}
+	}
+
 	const float Interval = 1.0f / FMath::Max(1, TargetFPS);
 	if (bNeedFrames)
 	{
@@ -227,55 +266,74 @@ void AStreamManagerRTSP::Tick(float DeltaTime)
 	}
 
 	// ── Alpha-composite overlay onto the scene image ──────────────────────────
-	if (LatestReady->bHasOverlay &&
-		LatestReady->OverlayImage.Num() == LatestReady->Image.Num())
+	const TArray<FColor>* OverlaySrc = nullptr;
+	if (LatestReady->bHasOverlay)
 	{
-		if (OverlayRefreshInterval > 1 &&
-			LatestReady->OverlayImage.GetData() != CachedOverlayPixels.GetData())
-		{
-			CachedOverlayPixels = LatestReady->OverlayImage;
-		}
-
+		OverlaySrc = LatestReady->bFreshOverlay ? &LatestReady->OverlayImage
+		                                        : LatestReady->CachedOverlay.Get();
+	}
+	if (OverlaySrc && OverlaySrc->Num() == LatestReady->Image.Num())
+	{
 		const int32   PixelCount  = LatestReady->Image.Num();
 		FColor*       SceneData   = LatestReady->Image.GetData();
-		const FColor* OverlayData = LatestReady->OverlayImage.GetData();
+		const FColor* OverlayData = OverlaySrc->GetData();
 
-		for (int32 i = 0; i < PixelCount; ++i)
+		// 2M pixels per 1080p frame — blend in parallel chunks instead of a
+		// single game-thread loop.
+		const int32 ChunkSize = 64 * 1024;
+		const int32 NumChunks = FMath::DivideAndRoundUp(PixelCount, ChunkSize);
+		ParallelFor(NumChunks, [SceneData, OverlayData, PixelCount, ChunkSize](int32 Chunk)
 		{
-			const uint8 A = OverlayData[i].A;
-			if (A == 0) continue;
-			if (A == 255)
+			const int32 End = FMath::Min((Chunk + 1) * ChunkSize, PixelCount);
+			for (int32 i = Chunk * ChunkSize; i < End; ++i)
 			{
-				SceneData[i] = OverlayData[i];
+				const uint8 A = OverlayData[i].A;
+				if (A == 0) continue;
+				if (A == 255)
+				{
+					SceneData[i] = OverlayData[i];
+				}
+				else
+				{
+					const uint32 InvA = 255 - A;
+					SceneData[i].R = (uint8)((OverlayData[i].R * A + SceneData[i].R * InvA + 127) / 255);
+					SceneData[i].G = (uint8)((OverlayData[i].G * A + SceneData[i].G * InvA + 127) / 255);
+					SceneData[i].B = (uint8)((OverlayData[i].B * A + SceneData[i].B * InvA + 127) / 255);
+					SceneData[i].A = 255;
+				}
 			}
-			else
-			{
-				const uint32 InvA = 255 - A;
-				SceneData[i].R = (uint8)((OverlayData[i].R * A + SceneData[i].R * InvA + 127) / 255);
-				SceneData[i].G = (uint8)((OverlayData[i].G * A + SceneData[i].G * InvA + 127) / 255);
-				SceneData[i].B = (uint8)((OverlayData[i].B * A + SceneData[i].B * InvA + 127) / 255);
-				SceneData[i].A = 255;
-			}
+		});
+
+		// A fresh overlay readback becomes the new shared cache (moved, not copied).
+		if (LatestReady->bFreshOverlay)
+		{
+			CachedOverlayShared = MakeShared<TArray<FColor>, ESPMode::ThreadSafe>(MoveTemp(LatestReady->OverlayImage));
 		}
 	}
 
 	// ── Push the BGRA frame into the GStreamer appsrc(s) ──────────────────────
 	// FColor is laid out B,G,R,A in memory → matches the appsrc "BGRA" caps.
-	// The same buffer feeds both the RTSP and the WebRTC/WHIP pipelines.
+	// The pixels are MOVED into a refcounted owner and wrapped zero-copy into a
+	// GstBuffer per pipeline (each keeps its own PTS) — no per-sink memcpy.
 	if (LatestReady->Image.Num() > 0)
 	{
-		const uint8_t* const Pixels = reinterpret_cast<const uint8_t*>(LatestReady->Image.GetData());
 		const int32 SizeBytes = LatestReady->Image.Num() * (int32)sizeof(FColor);
+		const int32 NumSinks  = (StreamerImpl ? 1 : 0) + (WhipStreamerImpl ? 1 : 0);
+		if (NumSinks > 0)
+		{
+			FSharedFrameOwner* Owner = new FSharedFrameOwner(MoveTemp(LatestReady->Image), NumSinks);
+			const uint8_t* const Pixels = reinterpret_cast<const uint8_t*>(Owner->Pixels.GetData());
 
-		if (StreamerImpl)
-		{
-			StreamerImpl->PushFrame(Pixels, SizeBytes);
+			if (StreamerImpl)
+			{
+				StreamerImpl->PushFrameZeroCopy(Pixels, SizeBytes, Owner, &FSharedFrameOwner::Release);
+			}
+			if (WhipStreamerImpl)
+			{
+				WhipStreamerImpl->PushFrameZeroCopy(Pixels, SizeBytes, Owner, &FSharedFrameOwner::Release);
+			}
+			FrameCounter++;
 		}
-		if (WhipStreamerImpl)
-		{
-			WhipStreamerImpl->PushFrame(Pixels, SizeBytes);
-		}
-		FrameCounter++;
 	}
 
 	delete LatestReady;
@@ -299,8 +357,11 @@ void AStreamManagerRTSP::SetupCaptureComponent()
 	Capture->CaptureSource = ESceneCaptureSource::SCS_FinalColorLDR;
 	Capture->TextureTarget->TargetGamma = GEngine->GetDisplayGamma();
 	Capture->ShowFlags.SetTemporalAA(true);
-	// RTSP is now the sole consumer of this capture; ensure it renders each frame.
-	Capture->bCaptureEveryFrame = true;
+	// The capture render is expensive (a second full scene render). Keep it OFF
+	// until a consumer appears — Tick() toggles bCaptureEveryFrame with
+	// IsStreaming(). bCaptureOnMovement would sneak captures back in while idle.
+	Capture->bCaptureEveryFrame = false;
+	Capture->bCaptureOnMovement = false;
 
 	UE_LOG(LogStreamRTSP, Verbose, TEXT("RTSP capture render target initialised (%dx%d)"), FrameWidth, FrameHeight);
 }
@@ -351,10 +412,11 @@ void AStreamManagerRTSP::CaptureNonBlocking()
 				OverlayFrameCounter = 0;
 				bFreshOverlayRender = true;
 				RenderRequest->bHasOverlay = true;
+				RenderRequest->bFreshOverlay = true;
 			}
-			else if (CachedOverlayPixels.Num() > 0)
+			else if (CachedOverlayShared.IsValid() && CachedOverlayShared->Num() > 0)
 			{
-				RenderRequest->OverlayImage = CachedOverlayPixels;
+				RenderRequest->CachedOverlay = CachedOverlayShared;   // ref only, no pixel copy
 				RenderRequest->bHasOverlay = true;
 			}
 		}
@@ -451,7 +513,7 @@ void AStreamManagerRTSP::DrainRenderQueue()
 			QueueSize--;
 		}
 	}
-	CachedOverlayPixels.Empty();   // old-size overlay cache is no longer valid
+	CachedOverlayShared.Reset();   // old-size overlay cache is no longer valid
 }
 
 void AStreamManagerRTSP::UpdateRenderTargetAfterFrameSizeChanged()

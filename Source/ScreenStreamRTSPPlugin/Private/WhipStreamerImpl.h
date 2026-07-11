@@ -67,6 +67,13 @@ public:
 	// A no-op once the pipeline has torn down (e.g. after a fatal WHIP error).
 	void PushFrame(const uint8_t* Bgra, int32_t SizeBytes);
 
+	// Zero-copy variant: wraps the caller's BGRA memory into the GstBuffer
+	// instead of allocating + memcpy. `ReleaseOwner(Owner)` is invoked exactly
+	// once when this pipeline is done with the memory — including every
+	// early-drop path (pipeline down, push failure). Thread-safe.
+	void PushFrameZeroCopy(const uint8_t* Bgra, int32_t SizeBytes,
+	                       void* Owner, void (*ReleaseOwner)(void*));
+
 	// Change the publish resolution at runtime WITHOUT tearing down the WHIP
 	// session: renegotiates the live appsrc caps (the auto-encoder reconfigures
 	// and emits a fresh keyframe — a brief glitch, the player auto-recovers).

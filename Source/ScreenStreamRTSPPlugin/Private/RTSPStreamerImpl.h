@@ -52,6 +52,13 @@ public:
 	// Dropped cheaply when no RTSP client is connected.
 	void PushFrame(const uint8_t* Bgra, int32_t SizeBytes);
 
+	// Zero-copy variant: wraps the caller's BGRA memory into the GstBuffer
+	// instead of allocating + memcpy. `ReleaseOwner(Owner)` is invoked exactly
+	// once when this pipeline is done with the memory — including every
+	// early-drop path (no client, push failure). Thread-safe.
+	void PushFrameZeroCopy(const uint8_t* Bgra, int32_t SizeBytes,
+	                       void* Owner, void (*ReleaseOwner)(void*));
+
 	// Change the stream resolution at runtime WITHOUT tearing down the RTSP
 	// session: updates the live appsrc caps (the H.264 encoder renegotiates and
 	// emits a fresh SPS/PPS keyframe — a brief glitch, the player auto-recovers)
