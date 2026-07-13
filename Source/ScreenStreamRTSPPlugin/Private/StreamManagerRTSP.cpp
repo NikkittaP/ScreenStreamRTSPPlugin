@@ -88,23 +88,33 @@ void AStreamManagerRTSP::BeginPlay()
 
 	SetupCaptureComponent();
 
-	FRTSPStreamerImpl::SetLogCallback(&RtspLogToUE);
-	StreamerImpl = new FRTSPStreamerImpl();
-
-	FRTSPStreamerImpl::FSettings Settings;
-	Settings.Port               = ServerPort;
-	Settings.MountPoint         = TCHAR_TO_UTF8(*MountPoint);
-	Settings.Width              = FrameWidth;
-	Settings.Height             = FrameHeight;
-	Settings.Fps                = TargetFPS;
-	Settings.BitrateKbps        = TargetBitrateKbps;
-	Settings.bUseHardwareEncoder = bUseHardwareEncoder;
-
-	if (!StreamerImpl->Start(Settings))
+	// The embedded RTSP server binds ServerPort. When disabled (WHIP-only rigs)
+	// we skip it entirely so several managers can coexist in one process without
+	// fighting over the port; the WHIP publish below is independent of RTSP.
+	if (bEnableRtsp)
 	{
-		UE_LOG(LogStreamRTSP, Error, TEXT("FRTSPStreamerImpl::Start failed; RTSP stream unavailable."));
-		delete StreamerImpl;
-		StreamerImpl = nullptr;
+		FRTSPStreamerImpl::SetLogCallback(&RtspLogToUE);
+		StreamerImpl = new FRTSPStreamerImpl();
+
+		FRTSPStreamerImpl::FSettings Settings;
+		Settings.Port               = ServerPort;
+		Settings.MountPoint         = TCHAR_TO_UTF8(*MountPoint);
+		Settings.Width              = FrameWidth;
+		Settings.Height             = FrameHeight;
+		Settings.Fps                = TargetFPS;
+		Settings.BitrateKbps        = TargetBitrateKbps;
+		Settings.bUseHardwareEncoder = bUseHardwareEncoder;
+
+		if (!StreamerImpl->Start(Settings))
+		{
+			UE_LOG(LogStreamRTSP, Error, TEXT("FRTSPStreamerImpl::Start failed; RTSP stream unavailable."));
+			delete StreamerImpl;
+			StreamerImpl = nullptr;
+		}
+	}
+	else
+	{
+		UE_LOG(LogStreamRTSP, Log, TEXT("RTSP server disabled (bEnableRtsp=false); WHIP-only publisher."));
 	}
 
 	// ── Optional WebRTC/WHIP publish (additive; independent of RTSP clients) ──

@@ -54,6 +54,13 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Stream")
 	int32 ServerPort = 8554;
 
+	/** Start the embedded RTSP server. Disable it to run a WHIP-only publisher
+	 *  (e.g. per-sensor SensorStreamRigs): multiple managers in one process would
+	 *  otherwise all try to bind the same ServerPort. Default true keeps the
+	 *  original single-manager RTSP behaviour untouched. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Stream")
+	bool bEnableRtsp = true;
+
 	/** RTSP mount path; full URL is rtsp://<host>:<ServerPort><MountPoint>. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Stream")
 	FString MountPoint = TEXT("/cam0");
