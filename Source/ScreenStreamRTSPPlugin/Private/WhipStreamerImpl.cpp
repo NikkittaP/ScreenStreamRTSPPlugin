@@ -274,6 +274,24 @@ bool FWhipStreamerImpl::Start(const FSettings& InSettings)
 						"signaller::auth-token", I->Settings.AuthToken.c_str(), nullptr);
 				}
 
+				// Congestion-control ramp: webrtcsink's GCC estimator starts at a
+				// low default bitrate and takes several seconds to ramp — the first
+				// seconds of every stream were visibly blocky/stuttery, worst right
+				// when the operator grabs PTZ on a fresh stream. Seed the estimator
+				// near the steady-state rate and keep a sane floor so it can't drop
+				// into slideshow territory on transient loss. Properties are looked
+				// up first so older gst-plugins-rs builds without them still work.
+				auto SetUintIfPresent = [](GstElement* E, const char* Name, guint Val)
+				{
+					if (g_object_class_find_property(G_OBJECT_GET_CLASS(E), Name))
+					{
+						g_object_set(E, Name, Val, nullptr);
+					}
+				};
+				SetUintIfPresent(Whip, "min-bitrate",   1000000u);   // 1 Mbps floor
+				SetUintIfPresent(Whip, "start-bitrate", 3000000u);   // skip the slow ramp
+				SetUintIfPresent(Whip, "max-bitrate",   6000000u);
+
 				std::lock_guard<std::mutex> Lock(I->AppSrcMutex);
 				I->AppSrc = AppSrc;   // keep the ref returned by get_by_name
 				I->FrameCount = 0;
