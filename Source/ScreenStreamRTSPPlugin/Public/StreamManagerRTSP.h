@@ -161,6 +161,21 @@ protected:
 	// BeginPlay only when bEnableWebRtc && !WhipUrl.IsEmpty(), deleted in EndPlay.
 	FWhipStreamerImpl* WhipStreamerImpl = nullptr;
 
+	/** (Re)create WhipStreamerImpl and start publishing to WhipUrl. Returns
+	 *  success. Used by BeginPlay and by the Tick auto-retry below. */
+	bool StartWhipPublisher();
+
+	// ── WHIP auto-retry ───────────────────────────────────────────────────────
+	// A WHIP publish can die transiently (ingress 503 while ICE gathering, SFU
+	// restart, network blip). The pipeline itself does not auto-restart (see
+	// WhipStreamerImpl.cpp bus loop), so Tick re-creates it with a capped
+	// exponential backoff. Without this, one failed rig stays black forever
+	// while its siblings stream fine.
+	float WhipRetryCountdown  = 0.0f;   // seconds until the next retry attempt
+	float WhipRetryDelay      = 0.0f;   // current backoff (0 → not scheduled)
+	static constexpr float WhipRetryDelayInitial = 2.0f;
+	static constexpr float WhipRetryDelayMax     = 30.0f;
+
 	// Completed-readback queue (newest frame wins; stale frames are dropped).
 	TQueue<FRenderRequestStreamRTSPStruct*> RenderRequestQueue;
 	std::atomic<int32> QueueSize{0};

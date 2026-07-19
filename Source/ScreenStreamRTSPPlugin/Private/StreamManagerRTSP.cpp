@@ -120,26 +120,46 @@ void AStreamManagerRTSP::BeginPlay()
 	// ── Optional WebRTC/WHIP publish (additive; independent of RTSP clients) ──
 	if (bEnableWebRtc && !WhipUrl.IsEmpty())
 	{
-		FWhipStreamerImpl::SetLogCallback(&WhipLogToUE);
-		WhipStreamerImpl = new FWhipStreamerImpl();
-
-		FWhipStreamerImpl::FSettings WhipSettings;
-		WhipSettings.WhipEndpoint = TCHAR_TO_UTF8(*WhipUrl);
-		WhipSettings.Width        = FrameWidth;
-		WhipSettings.Height       = FrameHeight;
-		WhipSettings.Fps          = TargetFPS;
-
-		if (!WhipStreamerImpl->Start(WhipSettings))
+		if (!StartWhipPublisher())
 		{
-			UE_LOG(LogStreamRTSP, Error, TEXT("FWhipStreamerImpl::Start failed; WebRTC publish unavailable (RTSP still works)."));
-			delete WhipStreamerImpl;
-			WhipStreamerImpl = nullptr;
+			UE_LOG(LogStreamRTSP, Error, TEXT("FWhipStreamerImpl::Start failed; WebRTC publish unavailable (RTSP still works). Will retry."));
 		}
 	}
 	else if (bEnableWebRtc)
 	{
 		UE_LOG(LogStreamRTSP, Warning, TEXT("bEnableWebRtc is true but WhipUrl is empty; WebRTC publish skipped."));
 	}
+}
+
+bool AStreamManagerRTSP::StartWhipPublisher()
+{
+	if (WhipStreamerImpl)
+	{
+		WhipStreamerImpl->Stop();
+		delete WhipStreamerImpl;
+		WhipStreamerImpl = nullptr;
+	}
+
+	FWhipStreamerImpl::SetLogCallback(&WhipLogToUE);
+	WhipStreamerImpl = new FWhipStreamerImpl();
+
+	FWhipStreamerImpl::FSettings WhipSettings;
+	WhipSettings.WhipEndpoint = TCHAR_TO_UTF8(*WhipUrl);
+	WhipSettings.Width        = FrameWidth;
+	WhipSettings.Height       = FrameHeight;
+	WhipSettings.Fps          = TargetFPS;
+
+	if (!WhipStreamerImpl->Start(WhipSettings))
+	{
+		delete WhipStreamerImpl;
+		WhipStreamerImpl = nullptr;
+		return false;
+	}
+
+	// Fresh publish is up — reset the backoff so the NEXT failure starts small.
+	WhipRetryDelay     = 0.0f;
+	WhipRetryCountdown = 0.0f;
+	return true;
 }
 
 void AStreamManagerRTSP::EndPlay(const EEndPlayReason::Type EndPlayReason)
@@ -196,6 +216,39 @@ bool AStreamManagerRTSP::IsStreaming() const
 void AStreamManagerRTSP::Tick(float DeltaTime)
 {
 	Super::Tick(DeltaTime);
+
+	// ── WHIP auto-retry ──────────────────────────────────────────────────────
+	// The publish died (bus ERROR/EOS → IsRunning()==false) or never started
+	// (e.g. ingress answered 503 "timed out while waiting for ICE candidate
+	// gathering" during a burst of simultaneous rig start-ups). Re-create the
+	// pipeline with capped exponential backoff: 2s → 4s → … → 30s.
+	if (bEnableWebRtc && !WhipUrl.IsEmpty() && IsValid(CaptureComponent) &&
+		(WhipStreamerImpl == nullptr || !WhipStreamerImpl->IsRunning()))
+	{
+		if (WhipRetryDelay <= 0.0f)
+		{
+			WhipRetryDelay     = WhipRetryDelayInitial;
+			WhipRetryCountdown = WhipRetryDelayInitial;
+			UE_LOG(LogStreamRTSP, Warning,
+				TEXT("WHIP publish is down (url=%s); retrying in %.0fs."), *WhipUrl, WhipRetryDelay);
+		}
+		else
+		{
+			WhipRetryCountdown -= DeltaTime;
+			if (WhipRetryCountdown <= 0.0f)
+			{
+				UE_LOG(LogStreamRTSP, Log, TEXT("WHIP publish retry (url=%s)…"), *WhipUrl);
+				if (!StartWhipPublisher())
+				{
+					// Start() itself failed — schedule the next attempt, backed off.
+					WhipRetryDelay     = FMath::Min(WhipRetryDelay * 2.0f, WhipRetryDelayMax);
+					WhipRetryCountdown = WhipRetryDelay;
+				}
+				// On success StartWhipPublisher() reset the backoff to 0; if the
+				// publish dies again later, the branch above re-arms from 2s.
+			}
+		}
+	}
 
 	// ── Self-driven capture cadence ──────────────────────────────────────────
 	// Only burn GPU on readback while someone needs the frames: an RTSP client is
